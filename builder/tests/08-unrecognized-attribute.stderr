@@ -1,5 +1,16 @@
 error: expected `builder(each = "...")`
-  --> $DIR/08-unrecognized-attribute.rs:22:7
-   |
-22 |     #[builder(eac = "arg")]
-   |       ^^^^^^^^^^^^^^^^^^^^
+   --> $DIR/08-unrecognized-attribute.rs:19:10
+    |
+19  |   #[derive(Builder)]
+    |            ^^^^^^^ in this macro invocation
+    |
+   ::: $WORKSPACE/builder/src/lib.rs
+    |
+    | / pub fn derive(input: TokenStream) -> TokenStream {
+28  | |     let ast: DeriveInput = syn::parse(input).unwrap();
+29  | |
+30  | |     let identifier = ast.ident;
+...   |
+149 | |     tokens.into()
+150 | | }
+    | |_- in this expansion of `#[derive(Builder)]`
