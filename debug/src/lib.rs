@@ -1,61 +1,79 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
+use quote::ToTokens;
+use core::str::FromStr;
 use quote::quote;
+use std::iter::FromIterator;
 use syn::parse_macro_input;
 use syn::parse_quote;
 use syn::token::Comma;
 use syn::DeriveInput;
-use syn::GenericArgument;
 use syn::Lit;
 use syn::Meta;
-use syn::PathArguments;
 use syn::WherePredicate;
 
-fn add_debug_trait(mut generics: syn::Generics) -> syn::Generics {
-    for param in &mut generics.params {
-        if let syn::GenericParam::Type(p) = param {
-            p.bounds.push(parse_quote!(std::fmt::Debug));
-        }
-    }
-    generics
+enum TypeEnum {
+    NormalType(syn::Type),
+    PhantomType(syn::Type),
+    AssociatedType(syn::Type),
+    ParameterType(syn::Type),
 }
 
-enum TypeEnum<'a> {
-    NormalType(&'a syn::Type),
-    PhantomType(&'a syn::Type),
-    AssociatedType(&'a syn::Type),
-}
-
-fn record_type<'a>(t: &'a syn::Type) -> TypeEnum<'a> {
+fn record_type(t: syn::Type, v: &Vec<syn::Ident>) -> TypeEnum {
+    let t_clone = t.clone();
     match t {
-        syn::Type::Path(path) => {
-            match &path.qself {
-                Some(_) => TypeEnum::AssociatedType(&t),
-                None => {
-                    let last_segment = path.path.segments.last().unwrap();
-                    match &last_segment.arguments {
-                        syn::PathArguments::AngleBracketed(angle_args) => {
-                            if last_segment.ident == syn::Ident::new("PhantomData", proc_macro2::Span::call_site()) {
-                                TypeEnum::PhantomType(&t)
-                            } else {
-                                match angle_args.args.first().unwrap() {
-                                    syn::GenericArgument::Type(arg_type) => {
-                                        record_type(arg_type)
-                                    },
-                                    _ => unimplemented!(),
-                                }
-                            }
-                        },
-                        syn::PathArguments::Parenthesized(_) => unimplemented!(), 
-                        syn::PathArguments::None => {
-                            TypeEnum::NormalType(&t)
-                        },
+        syn::Type::Path(path) => match &path.qself {
+            Some(qself) => {
+                let q_clone = qself.ty.as_ref().clone();
+                match qself.ty.as_ref() {
+                    syn::Type::Path(ty) => {
+                        let type_ident = &ty.path.segments.first().unwrap().ident;
+                        if v.contains(&type_ident) {
+                            TypeEnum::AssociatedType(t_clone)
+                        } else {
+                            record_type(q_clone, v)
+                        }
                     }
-                },
+                    _ => unimplemented!(),
+                }
+            }
+            None => {
+                let first_segment = path.path.segments.first().unwrap();
+                match &first_segment.arguments {
+                    syn::PathArguments::AngleBracketed(angle_args) => {
+                        if first_segment.ident
+                            == syn::Ident::new("PhantomData", proc_macro2::Span::call_site())
+                        {
+                            TypeEnum::PhantomType(t_clone)
+                        } else {
+                            match angle_args.args.first().unwrap() {
+                                syn::GenericArgument::Type(arg_type) => {
+                                    let arg_clone = arg_type.clone();
+                                    record_type(arg_clone, &v)
+                                }
+                                _ => unimplemented!(),
+                            }
+                        }
+                    }
+                    syn::PathArguments::Parenthesized(_) => unimplemented!(),
+                    syn::PathArguments::None => {
+                        if v.contains(&first_segment.ident) && path.path.segments.len() > 1 {
+                            TypeEnum::AssociatedType(t_clone)
+                        } else if v.contains(&first_segment.ident) {
+                            TypeEnum::ParameterType(t_clone)
+                        } else {
+                            TypeEnum::NormalType(t_clone)
+                        }
+                    }
+                }
             }
         },
-        _ => unimplemented!(),
+        syn::Type::Reference(reference) => {
+            let ref_type = reference.elem.as_ref().clone();
+            TypeEnum::NormalType(ref_type)
+        }
+        _ => TypeEnum::NormalType(t_clone),
     }
 }
 
@@ -64,6 +82,19 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
     let mut generics = ast.generics;
+    let generic_params = {
+        let generics_bor = &generics.params;
+        Vec::from_iter(
+            generics_bor
+                .iter()
+                .map(|g| match g {
+                    syn::GenericParam::Type(k) => Some(k.ident.clone()),
+                    _ => None,
+                })
+                .filter(Option::is_some)
+                .map(|g| g.unwrap()),
+        )
+    };
 
     let struct_name = ast.ident;
     let struct_name_str = format!("{}", struct_name);
@@ -73,9 +104,9 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let mut field_types = vec![];
     let mut field_formats = vec![];
 
-    let mut normal_field_types = vec![];
-    let mut phantom_data_types = vec![];
-    let mut associated_data_types = vec![];
+    let mut where_types = vec![];
+
+    let mut where_clause_option = None;
 
     match ast.data {
         syn::Data::Struct(data) => match data.fields {
@@ -85,35 +116,6 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     field_names_str.push(format!("{}", field_name));
                     field_names.push(field_name);
                     field_types.push(&f.ty);
-
-                    match &f.ty {
-                        syn::Type::Path(path) => match &path.qself {
-                            Some(_) => {
-                                associated_data_types.push((&f.ty).clone());
-                            },
-                            None => {
-                                let first_segment = path.path.segments.first().unwrap();
-                                println!("{:?}", first_segment.ident);
-                                match first_segment.ident.to_string().as_str() {
-                                    "PhantomData" => match &first_segment.arguments {
-                                        PathArguments::AngleBracketed(brackets) => {
-                                            match brackets.args.first().unwrap() {
-                                                GenericArgument::Type(t) => {
-                                                    phantom_data_types.push(t.clone());
-                                                }
-                                                _ => unimplemented!(),
-                                            }
-                                        }
-                                        _ => unimplemented!(),
-                                    },
-                                    _ => {
-                                        normal_field_types.push(&f.ty);
-                                    }
-                                }
-                            }
-                        },
-                        _ => {}
-                    }
 
                     let mut format_option = None;
                     for attr in &f.attrs {
@@ -140,6 +142,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
                         }
                     }
                     field_formats.push(format_option.unwrap_or(String::from("{:?}")));
+
+                    where_types.push(record_type((&f.ty).clone(), &generic_params));
                 }
             }
             _ => unimplemented!(),
@@ -147,46 +151,91 @@ pub fn derive(input: TokenStream) -> TokenStream {
         _ => unimplemented!(),
     }
 
-    println!("We have {:?} associated types", associated_data_types.len());
-    for param in &mut generics.params {
-        if let syn::GenericParam::Type(p) = param {
-            if phantom_data_types.iter().any(|t| match t {
-                syn::Type::Path(path) => {
-                    let path_ident = &path.path.segments.first().unwrap().ident;
-                    path_ident == &p.ident
+    for attr in ast.attrs {
+        let attr_name = attr.path.segments.first().unwrap().ident.clone();
+        match attr_name.to_string().as_str() {
+            "debug" => match attr.parse_args().expect("Could not unwrap deubg attr") {
+                Meta::NameValue(name_value_meta) => {
+                    let name_ident = name_value_meta
+                        .path
+                        .segments
+                        .first()
+                        .unwrap()
+                        .ident
+                        .clone();
+                    match name_ident.to_string().as_str() {
+                        "bound" => {
+                            if let Lit::Str(value) = name_value_meta.lit {
+                                where_types.clear();
+
+                                let v = format!("where {}", value.value());
+                                where_clause_option = Some(v);
+                            }
+                        }
+                        _ => unimplemented!(),
+                    }
                 }
-                _ => false,
-            }) {
-                let where_token = syn::token::Where {
-                    span: syn::export::Span::call_site(),
-                };
-                let mut where_clause_option = generics.where_clause.take();
-                let where_clause = where_clause_option.get_or_insert(syn::WhereClause {
-                    where_token: where_token,
-                    predicates: syn::punctuated::Punctuated::<WherePredicate, Comma>::new(),
-                });
-                where_clause
-                    .predicates
-                    .push_value(parse_quote!(PhantomData<#p>: std::fmt::Debug));
-                generics.where_clause = Some(where_clause_option.take().unwrap());
-            } else if associated_data_types.iter().any(|t| match t {
-                syn::Type::Path(path_type) => {
-                    println!("choosing associated type");
-                    let path_ident = &path_type.path.segments.first().unwrap().ident;
-                    println!("{:?}", path_ident);
-                    println!("{:?}", p.ident);
-                    path_ident == &p.ident
-                },
-                _ => { println!("wow"); false },
-            }) {
-                println!("associated type here");
-            } else {
-                p.bounds.push(parse_quote!(std::fmt::Debug));
-            }
+                _ => unimplemented!(),
+            },
+            _ => unimplemented!(),
         }
     }
 
-    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    drop(generic_params);
+
+    for te in where_types {
+        let where_token = syn::token::Where {
+            span: syn::export::Span::call_site(),
+        };
+
+        let mut where_clause_option = generics.where_clause.take();
+
+        let where_clause = where_clause_option.get_or_insert(syn::WhereClause {
+            where_token: where_token,
+            predicates: syn::punctuated::Punctuated::<WherePredicate, Comma>::new(),
+        });
+
+        match te {
+            TypeEnum::NormalType(_) => {}
+            TypeEnum::ParameterType(t) => {
+                for param in &mut generics.params {
+                    if let syn::GenericParam::Type(p) = param {
+                        if let syn::Type::Path(k) = &t {
+                            let first_segment = &k.path.segments.first().unwrap();
+                            if first_segment.ident == p.ident {
+                                p.bounds.push(parse_quote!(std::fmt::Debug));
+                            }
+                        }
+                    }
+                }
+            }
+            TypeEnum::AssociatedType(t) => {
+                let predicate = parse_quote!(#t: std::fmt::Debug);
+
+                where_clause.predicates.push_value(predicate);
+
+                generics.where_clause = Some(where_clause_option.take().unwrap());
+            }
+            TypeEnum::PhantomType(t) => {
+                let predicate = parse_quote!(PhantomData<#t>: std::fmt::Debug);
+                where_clause.predicates.push_value(predicate);
+
+                generics.where_clause = Some(where_clause_option.take().unwrap());
+            }
+        };
+    }
+
+    let (impl_generics, type_generics, where_clause_gen) = generics.split_for_impl();
+
+    let where_clause = if let Some(s) = where_clause_option {
+        proc_macro2::TokenStream::from_str(s.as_str()).unwrap()
+    } else {
+        match where_clause_gen {
+            Some(s) => s.to_token_stream(),
+            None => proc_macro2::TokenStream::from_str("").unwrap(),
+        }
+    };
+
     let tokens = quote! {
         impl #impl_generics std::fmt::Debug for #struct_name #type_generics #where_clause {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
